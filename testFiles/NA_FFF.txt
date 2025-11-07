@@ -1,0 +1,3 @@
+This is the first text file.
+It contains some sample content.
+You can edit this file as needed.
