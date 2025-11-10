@@ -25,3 +25,6 @@ for k v in ${(kv)IDENTIFERS_FOLDERS}; do
 	echo "IDENTIFERS_FOLDERS[$k]=${v}"
 done
 echo
+
+mm="meta"
+echo $IDENTIFERS_FOLDERS["$mm"]

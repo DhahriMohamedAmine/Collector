@@ -43,11 +43,11 @@ typeset -A MARKET_LOOKUP
 typeset -A GROUP_LOOKUP
 
 # Associative array mapping identifier types (e.g., "partner", "offer") to a pipe-separated list of regex aliases
-typeset -A IDENTIFIER_ALIASES
+typeset -A IDENTIFERS_ALIASES
 # Associative array mapping a specific alias (e.g., "you tube") to its canonical name (e.g., "Youtube")
-typeset -A IDENTIFIER_CANONICAL_NAMES
+typeset -A IDENTIFERS_NAMES
 # Associative array mapping a specific alias (e.g., "you tube") to its folder name (e.g., "03. Youtube")
-typeset -A IDENTIFIER_FOLDERS
+typeset -A IDENTIFERS_FOLDERS
 
 # Array to store export filters, sorted by specificity (most specific first)
 typeset -a EXPORT_FILTERS
@@ -233,11 +233,9 @@ noOffer:noOffer:noOffer, no Offer'
 
     # Use 'eval' to dynamically build ZSH associative arrays from the JSON data
     # IDENTIFIER_ALIASES['partner'] = "linear|ctv|you tube|..."
-	eval $(jq -r 'to_entries[] | "IDENTIFIER_ALIASES[\(.key|@json)]=" + ([.value[].alias | gsub(", "; "|")] | join("|") | @sh)' <<< "$identifiers_db_json")
-    # IDENTIFIER_CANONICAL_NAMES['you tube'] = "Youtube"
-	eval $(jq -r 'to_entries[] | .value[] | .name as $n | (.alias | split(", "))[] | "IDENTIFIER_CANONICAL_NAMES[\(.|@json)]=\($n|@sh)"' <<< "$identifiers_db_json")
-    # IDENTIFIER_FOLDERS['you tube'] = "03. Youtube"
-	eval $(jq -r 'to_entries[] | .value[] | .folder as $f | (.alias | split(", "))[] | "IDENTIFIER_FOLDERS[\(.|@json)]=\($f|@sh)"' <<< "$identifiers_db_json")
+	eval "$(jq -r 'to_entries[] | .key as $k | [.value[].alias | gsub(", "; "|")] | join("|") as $a | "IDENTIFERS_ALIASES[\($k)]=\"\($a)\""' <<< "$identifiers_db_json")"
+	eval "$(jq -r 'to_entries[] | .value[] | .name as $n | (.alias | split(", "))[] | "IDENTIFERS_NAMES[\"\(.)\"]=\"\($n)\""' <<< "$identifiers_db_json")"
+	eval "$(jq -r 'to_entries[] | .value[] | .folder as $f | (.alias | split(", "))[] | "IDENTIFERS_FOLDERS[\"\(.)\"]=\"\($f)\""' <<< "$identifiers_db_json")"
 }
 
 #
@@ -250,12 +248,14 @@ function load_export_lookups() {
 		defaults write "$SCRIPT_DOMAIN" 'export' -dict "{}"
 
         # Default data: Filter:NameTemplate:FolderTemplate
-		local default_export_rules_data='DEFAULT:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER
-partner=Responsive:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=Discovery:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=Responsive, size=960x1200:MARKET_TICKET_Discovery_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=Discovery, size=960x1200:MARKET_TICKET_Discovery_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=companionBanner:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER/youtube'
+		local default_export_rules_data='DEFAULT:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match
+partner=Responsive:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner=Discovery:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner=Responsive, size=960x1200:MARKET_TICKET_Discovery_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner=Discovery, size=960x1200:MARKET_TICKET_Discovery_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner=companionBanner:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/youtube
+partner=HTML, FORMAT=Static:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/preview'
+
 
 		while IFS=':' read -r filter name folder; do
 			defaults write "$SCRIPT_DOMAIN" export -dict-add "$filter" "{ name = \"$name\"; folder = \"$folder\"; }"
@@ -278,8 +278,8 @@ partner=companionBanner:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER/
 	done | sort -nr | cut -d' ' -f2-)}")
 
     # Populate the name and folder template lookup tables
-	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_NAME_TEMPLATES[\($k|@sh)]=\(.value.name|@sh)"' <<< "$export_db_json")
-	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_FOLDER_TEMPLATES[\($k|@sh)]=\(.value.folder|@sh)"' <<< "$export_db_json")
+	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_NAME_TEMPLATES[\"\($k)\"]=\"\(.value.name)\""' <<< "$export_db_json")
+	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_FOLDER_TEMPLATES[\"\($k)\"]=\"\(.value.folder)\""' <<< "$export_db_json")
 }
 
 #endregion
@@ -393,7 +393,12 @@ function parse_file() {
 	typeset -A asset_metadata
 	asset_metadata[NAME]="${filepath##*/}"
 	asset_metadata[EXTENSION]="${filepath##*.}"
-	asset_metadata[INDEX]="" && [[ "$asset_metadata[NAME]" =~ '_([0-9]{2})\.' ]] && asset_metadata[INDEX]="${match[1]}"
+
+	asset_metadata[INDEX]=""
+	local index_regex='_([0-9]{2})\.'$asset_metadata[EXTENSION]'$'
+	if [[ "$asset_metadata[NAME]" =~ $index_regex ]]; then
+		asset_metadata[INDEX]="${match[1]}"
+	fi
 
     # Get metadata from file content/properties
 	asset_metadata[MARKETS]=""
@@ -409,16 +414,21 @@ function parse_file() {
 		[[ -z $asset_metadata[MARKETS] ]] && asset_metadata[MARKETS]=$(get_markets "${current_path_level##*/}")
 
         # Check for all other identifiers (partner, offer, etc.)
-		for identifier_key in ${(k)IDENTIFIER_ALIASES}; do
-			local key=${identifier_key//\"/}
-			key=${(U)key} # Uppercase the key (e.g., "PARTNER")
-			[[ -n $asset_metadata[$key] ]] && continue
-
-			for alias in ${(s:|:)IDENTIFIER_ALIASES[$identifier_key]}; do
-                # Check if the alias (e.g., "you tube") is in the current path component
-				if [[ "${current_path_level##*/}" =~ .*(${alias// /[^[:alnum:]]?}) ]]; then
-                    # Only set if not already found (first match wins)
-					[[ -z $asset_metadata[$key] ]] && asset_metadata[$key]=$alias
+		for k v in ${(kv)IDENTIFERS_ALIASES}; do
+			[[ -n $asset_metadata[$k] ]] && continue
+			asset_metadata[$k]=""
+			asset_metadata[${k}.name]=""
+			asset_metadata[${k}.folder]=""
+			asset_metadata[${k}.match]=""
+			
+			# echo "$k -- $v"
+			for alias in ${(s:|:)v}; do
+				# echo "$alias"
+				if [[ "${current_path_level##*/}" =~ ($alias) ]]; then
+					asset_metadata[$k]="$alias"
+					asset_metadata[${k}.name]="$IDENTIFERS_NAMES["$alias"]"
+					asset_metadata[${k}.folder]="$IDENTIFERS_FOLDERS["$alias"]"
+					asset_metadata[${k}.match]="$match[1]"
 					break
 				fi
 			done
@@ -431,9 +441,10 @@ function parse_file() {
 	done
 	unsetopt nocasematch
 
+
     # --- Validate essential metadata ---
 	[[ -z $asset_metadata[MARKETS] ]] && errors+=(MARKETS)
-	[[ -z $asset_metadata[PARTNER] ]] && errors+=(PARTNER)
+	[[ -z $asset_metadata[partner] ]] && errors+=(PARTNER)
 	[[ -z $asset_metadata[FORMAT] ]] && errors+=(FORMAT)
 	[[ -z $asset_metadata[SIZE] ]] && errors+=(SIZE)
 
@@ -442,91 +453,68 @@ function parse_file() {
 		return 0 # Return success to not stop the loop
 	fi
 
-    # --- Find matching export rule ---
+	# for k v in ${(kv)asset_metadata}; do
+	# 	echo "[$k] = $v"
+	# done
+	# echo
 
-    # Sub-function to check if asset metadata matches a filter rule
-	function filter_check() {
-		local filter_key="$1"
-		local rule_part
+	function rule_check() {
+		local rule="$1"
 
-        # Check each part of the filter key (e.g., "partner=Youtube", "size=1080x1080")
-		for rule_part in ${(s:, :)filter_key}; do
-			local rule_key=${rule_part%%=*}
-			rule_key=${(U)rule_key} # e.g., "PARTNER"
-			local rule_value="" && [[ $rule_part == *=* ]] && rule_value=${rule_part##*=} # e.g., "Youtube"
+		for condition in ${(s:, :)rule}; do
+			local identifier=${condition%%=*}
+			local value=${condition##$identifier} && value=${value//=/}
+			local asset_value="$asset_metadata[$identifier]"
+			[[ -n "$asset_metadata[$identifier.name]" ]] && asset_value="$asset_metadata[$identifier.name]"
 
-            # Get the actual value from the asset
-			local metadata_value="$asset_metadata[$rule_key]"
-            # For identifiers, use the canonical name for matching
-			[[ $rule_key =~ (SIZE|NAME|MARKET|FORMAT|INDEX|EXTENSION) ]] || metadata_value="$IDENTIFIER_CANONICAL_NAMES["$metadata_value"]"
-			
-            # Check for match
-            # Fails if:
-            #   - rule_value is set AND metadata_value does not contain it
-            #   - rule_value is NOT set AND metadata_value is empty
-			if ! [[ ( -n "$rule_value" && -n "$metadata_value" && "${(U)metadata_value}" == "${(U)rule_value}" ) || ( -z "$rule_value" && -n "$metadata_value" ) ]]; then
-				return 1 # No match
+			if ! [[ ( -n "$value" && "$value" == "$asset_value" ) || ( -z "$value" && -n "$asset_metadata" ) ]]; then
+				return 1
 			fi
 		done
-		return 0 # All parts matched
+
+		return 0
 	}
 
-	local matched_filter_key='DEFAULT'
-    # Loop through sorted filters (most specific first)
-	for filter_key in ${(f)${EXPORT_FILTERS[@]}}; do
-		[[ $filter_key == 'DEFAULT' ]] && continue
-
-		if filter_check "$filter_key"; then
-			matched_filter_key="$filter_key"
-			break # Found the best match
+	local matched_rule="DEFAULT"
+	for rule in ${(f)EXPORT_FILTERS[@]}; do
+		[[ "$rule" == "DEFAULT" ]] && continue
+		
+		if rule_check "$rule"; then
+			matched_rule="$rule"
+			break
 		fi
 	done
 
-    # Get the templates for the matched filter
-	matched_filter_key="'${matched_filter_key}'"
-	local filename_template=${EXPORT_NAME_TEMPLATES[$matched_filter_key]}
-	local folder_path_template=${EXPORT_FOLDER_TEMPLATES[$matched_filter_key]}
+	local name_template="$EXPORT_NAME_TEMPLATES["$matched_rule"]"
+	local folder_template="$EXPORT_FOLDER_TEMPLATES["$matched_rule"]"
 
-    # --- Generate new name and path for each market ---
+	local keys="${${${(k)asset_metadata}// /\n}//./ }"
+	keys=$(print -l ${(on)"${(f)keys}"} | awk '{ print NF, $0 }' | sort -rn | cut -d' ' -f2-)
+	keys=${keys// /.}
+	
 	for market in ${(s: :)asset_metadata[MARKETS]}; do
-		local new_filename=$filename_template
-		new_filename=${new_filename//_/} # Clear underscores for clean building
-		new_filename=${new_filename//MARKET/${market}_}
-		new_filename=${new_filename//TICKET/${TICKET_ID}_}
+		local new_name="${name_template//MARKET/$market}"
+		local new_path="${folder_template//MARKET/$market}"
+		new_name=${new_name//TICKET/$TICKET_ID}
 
-		local new_folder_path=$folder_path_template
-		new_folder_path=${new_folder_path//MARKET/$market}
-		new_folder_path=${new_folder_path//TICKET/$TICKET_ID}
-
-        # Substitute all other metadata values into the templates
-		for meta_key meta_value in ${(kv)asset_metadata}; do
-			[[ $meta_key == MARKET ]] && continue
-
-			if [[ $meta_key =~ (SIZE|NAME|MARKET|FORMAT|INDEX|EXTENSION) ]]; then
-                # For simple values (SIZE, FORMAT, etc.), just substitute
-				new_filename=${new_filename//$meta_key/${meta_value:+_$meta_value}}
-				new_folder_path=${new_folder_path//$meta_key/$meta_value}
-			else
-                # For identifier values (PARTNER, OFFER, etc.), use their canonical names/folder names
-				local canonical_name="$IDENTIFIER_CANONICAL_NAMES["$meta_value"]"
-				local folder_name_component="$IDENTIFIER_FOLDERS["$meta_value"]"
-
-				new_filename="${new_filename//$meta_key/${canonical_name:+_${canonical_name}}}"
-				new_folder_path="${new_folder_path//$meta_key/$folder_name_component}"
-			fi
+		for key in ${(f)keys}; do
+			new_name=${new_name//$key/$asset_metadata[$key]}
+			new_path=${new_path//$key/$asset_metadata[$key]}
 		done
 
-        # Clean up and finalize paths
-		new_filename=${new_filename//__/_} # Fix double underscores
-		new_filename=${new_filename//HTML_HTML/HTML}
-		new_filename="${new_filename}.${asset_metadata[EXTENSION]}"
-		new_folder_path="${DESTINATION_BASE_DIR%/}/${new_folder_path#/}"
+		new_name=${new_name//__/_}
+		new_name=${new_name%_}
+		new_name="${new_name}.$asset_metadata[EXTENSION]"
 
-        # Create directory and copy the file
-		mkdir -p "$new_folder_path"
-		cp "$filepath" "$new_folder_path/$new_filename"
+		new_path="${DESTINATION_BASE_DIR}/${new_path}"
+		new_path=${new_path//\/\//\/}
+		new_path=${new_path%\/}
 
-		echo "OK::${asset_metadata[NAME]}::${new_folder_path}::${new_filename}::"
+		mkdir -p "$new_path"
+		[[ -f "${new_path}/${new_name}" ]] && echo "WARR::${new_path}/${new_name}::"
+		cp -f "$filepath" "${new_path}/${new_name}"
+
+		echo "OK::${asset_metadata[NAME]}::${new_name}::${new_path}::"
 	done
 }
 #endregion
@@ -573,11 +561,33 @@ echo "$processing_results" | grep "^OK" | column -s '::' -t
 echo
 echo "Files with errors:"
 echo "$processing_results" | grep "^ERR" | column -s '::' -t
+echo
+echo "Warnings:"
+echo "$processing_results" | grep "^WARR" | column -s '::' -t
 
 #endregion
 
-# for k v in ${(kv)IDENTIFIER_FOLDERS}; do; echo "$k >$v<"; done
-# echo "$processing_results" | grep "^OK" | column -s '::' -t
+# process_count=0
+# while read -r file; do
+# 	parse_file "$file" &
+# 	(( process_count++ ))
 
+#     # Wait for processes to finish in batches of MAX_PROCESSES
+# 	if (( process_count % MAX_PROCESSES == 0 )); then
+#         wait
+#     fi
+# done < <(find "$SOURCE_REVIEW_DIR" -type f -not -path '*/.*' -name "*.*")
+# for k v in ${(kv)IDENTIFERS_ALIASES}; do
+# 	echo "IDENTIFERS_ALIASES[$k]=${v}"
+# done
 # echo
-# for k v in ${(kv)IDENTIFIER_ALIASES}; do; echo "$k: $v"; done
+
+# for k v in ${(kv)IDENTIFERS_NAMES}; do
+# 	echo "IDENTIFERS_NAMES[$k]=${v}"
+# done
+# echo
+
+# for k v in ${(kv)IDENTIFERS_FOLDERS}; do
+# 	echo "IDENTIFERS_FOLDERS[$k]=${v}"
+# done
+# echo
