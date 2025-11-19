@@ -1,42 +1,99 @@
 #!/bin/zsh
 # set -x
 
-#region
-DOMAIN="com.vistaprint.onlinedisplay.assetorganizer"
-VERSION="1.0.1"
-MAX_PROCS=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo 8)
+# -----------------------------------------------------------------------------
+# Asset Organizer Script
+#
+# This script scans one or more source directories for asset files (images,
+# videos, zips), parses their file and directory names to extract metadata
+# (market, partner, size, etc.), and then renames and copies them into an
+# organized destination directory structure based on defined export rules.
+#
+# It uses macOS 'defaults' to store and retrieve lookup tables for markets,
+# identifiers (partners, offers), and export rules.
+#
+# Usage:
+#   ./think_cleaned.zsh /path/to/source/one /path/to/source/two
+# -----------------------------------------------------------------------------
 
+#region == Configuration ==
+
+# Domain for macOS 'defaults' storage
+readonly SCRIPT_DOMAIN="com.vistaprint.onlinedisplay.assetorganizer"
+readonly SCRIPT_VERSION="1.0.1"
+
+# Max parallel processes to run (defaults to physical CPU count or 8)
+readonly MAX_PROCESSES=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo 8)
+
+# --- User-configurable Paths and Values ---
+
+# The base directory where organized assets will be copied.
+# This can be overridden by the get_dest_and_ticket function.
+DESTINATION_BASE_DIR="$HOME/Desktop/asset_organizer_FINAL"
+
+# The ticket ID to be embedded in new filenames.
+# This can be overridden by the get_dest_and_ticket function.
+TICKET_ID='TIX-XXXX'
+
+# The source directories to scan for new assets, populated from script arguments.
+SOURCE_DIRECTORIES=($@)
+# SOURCE_DIRECTORIES="/Users/mohamedaminedhahri/Desktop/Code/Collector/REVIEW"
+
+# Exit if no source directories are provided.
+(( ${#SOURCE_DIRECTORIES[@]} == 0 )) && echo "Error: No source directories provided." && return 1
+
+#endregion
+
+#region == Global Variables (Lookup Tables) ==
+
+# Associative array mapping market aliases (e.g., "USEN", "UK") to a canonical market code (e.g., "GBen")
 typeset -A MARKET_LOOKUP
+# Associative array mapping group aliases (e.g., "NA") to a space-separated list of market codes
 typeset -A GROUP_LOOKUP
 
-typeset -A IDENTIFERS
-typeset -A IDENTIFERS_NAMES
-typeset -A IDENTIFERS_FOLDERS
+# Associative array mapping identifier types (e.g., "partner") to a pipe-separated list of regex aliases
+typeset -A IDENTIFIER_TYPE_ALIASES
+# Associative array mapping a specific alias (e.g., "you tube") to its canonical name (e.g., "Youtube")
+typeset -A IDENTIFIER_ALIAS_TO_NAME
+# Associative array mapping a specific alias (e.g., "you tube") to its folder name (e.g., "03. Youtube")
+typeset -A IDENTIFIER_ALIAS_TO_FOLDER
 
-typeset -a EXPORT_FILTERS 
-typeset -A EXPORT_NAME
-typeset -A EXPORT_FOLDER
+# Array to store export filters, sorted by specificity (most specific first)
+typeset -a EXPORT_FILTERS
+# Associative array mapping a filter key (e.g., "partner=Youtube") to a filename template
+typeset -A EXPORT_NAME_TEMPLATES
+# Associative array mapping a filter key to a folder path template
+typeset -A EXPORT_FOLDER_TEMPLATES
 
-INPUT_DIRS=("/Users/mohamedaminedhahri/Desktop/Code/Collector/testFiles")
-TICKET='TIX-XXXX'
-DEST='/Users/mohamedaminedhahri/Desktop/Code/Collector/approved'
+#endregion
 
-#region
-function version_check () {
+#region == Database & Lookup Initialization Functions ==
+
+#
+# Checks the stored DB version against the script version.
+# If versions mismatch, it wipes the old DB to force recreation.
+#
+function check_and_update_db_version () {
 	local stored_version
-    stored_version=$(defaults read "$DOMAIN" DB_VERSION)
+    stored_version=$(defaults read "$SCRIPT_DOMAIN" DB_VERSION 2>/dev/null)
 
-    if [[ -z "$stored_version" || "$stored_version" < "$VERSION" ]]
-	then
-        defaults delete "$DOMAIN"
-        defaults write "$DOMAIN" DB_VERSION "$VERSION"
+    if [[ -z "$stored_version" || "$stored_version" < "$SCRIPT_VERSION" ]]; then
+        # Clear all settings for this domain if version is old or missing
+        defaults delete "$SCRIPT_DOMAIN"
+        # Write the new version
+        defaults write "$SCRIPT_DOMAIN" DB_VERSION "$SCRIPT_VERSION"
     fi
 }
 
-function create_markets_lookup() {
-	if ! defaults read "$DOMAIN" MARKETS
-	then
-		default_markets_DB='USen:US:EN:ALL NA EN
+#
+# Loads market and group lookup tables from 'defaults'.
+# If they don't exist, populates them with default data.
+#
+function load_market_lookups() {
+    # Check if MARKETS data exists; if not, create it
+	if ! defaults read "$SCRIPT_DOMAIN" MARKETS &>/dev/null; then
+        # Default data: Alias:Countries:Language:Groups
+		local default_markets_data='USen:US:EN:ALL NA EN
 USes:US:ES:ALL NA
 CAen:CA:EN:ALL NA EN
 CAfr:CA:FR:ALL NA
@@ -61,366 +118,816 @@ CHfr:CH:FR:ALL EU CH
 CHde:CH:DE:ALL EU CH
 CHit:CH:IT:ALL EU CH
 ATde:AT:DE:ALL EU AT
-ATit:AT:IT:ALL EU AT'
+ATit:ATLIT:IT:ALL EU AT'
 
-		while IFS=':' read -r alias Countries lang groups
-		do
-			defaults write "$DOMAIN" MARKETS -dict-add "$alias" "{ Countries = \"${Countries// /, }\"; Languages = \"${lang// /, }\"; Groups = \"${groups// /, }\"; }"
-		done <<< "$default_markets_DB"
+		while IFS=':' read -r alias countries lang groups; do
+            # Write data to macOS defaults
+			defaults write "$SCRIPT_DOMAIN" MARKETS -dict-add "$alias" "{ Countries = \"${countries// /, }\"; Languages = \"${lang// /, }\"; Groups = \"${groups// /, }\"; }"
+		done <<< "$default_markets_data"
 	fi
 
-	current_markets=$(defaults read "$DOMAIN" MARKETS | plutil -convert json -o - -)
+    # Read the stored market data as JSON
+	local current_markets_json
+    current_markets_json=$(defaults read "$SCRIPT_DOMAIN" MARKETS | plutil -convert json -o - -)
 
-	groups_regex=($(echo "$current_markets" | jq -r 'to_entries | .[] | .value.Groups | split(", ") | .[]'))
-	groups_regex=(${(u)groups_regex})
-	groups_regex="${(j:|:)groups_regex}"
+    # --- Populate ZSH Lookup Tables ---
 
-	for market in $(echo "$current_markets" | jq -r 'keys | .[]')
-	do
-		Languages=$(jq -r ".$market.Languages" <<< "$current_markets") && Languages=(${(s:, :)Languages})
-		Countries=$(jq -r ".$market.Countries" <<< "$current_markets") && Countries=(${(s:, :)Countries})
-		Groups=$(jq -r ".$market.Groups" <<< "$current_markets") && Groups=(${(s:, :)Groups})
+	local current_markets_json
+    current_markets_json=$(defaults read "$SCRIPT_DOMAIN" MARKETS | plutil -convert json -o - -)
+	current_markets_json=$(jq -r '
+	to_entries[] |
+		.key as $market |
+		(.value.Languages // "" | split(", ")) as $lang |
+		(.value.Countries // "" | split(", ")) as $country |
+		(.value.Groups // "" | split(", ")) as $groups |
+		([$country, $lang] | transpose | map(join(""))) as $country_lang |
+		([$lang, $country] | transpose | map(join(""))) as $lang_country |
+		($country_lang + $lang_country + $country) as $aliases |
+		"\($market)|\($groups | join(" "))|\($aliases | join(" "))"
+' <<< "$current_markets_json")
 
-		market_aliases=(${Languages:^^Countries} ${Countries:^^Languages})
-		market_aliases=$(perl -pe 's/ /++$c % 2 == 1 ? "" : $& /ge' <<< $market_aliases)
-		market_aliases=${market_aliases//GLOBALGLOBAL/GLOBAL}
-		market_aliases=(${(s: :)market_aliases})
-		market_aliases=($market_aliases $Countries)
+	while IFS='|' read -r market groups_array alias_array; do
+		local groups=(${(s: :)groups_array})
+		local market_aliases=(${(s: :)alias_array})
 
-		for group in ${Groups[@]}
-		do
+		for group in ${groups[@]}; do
 			GROUP_LOOKUP[$group]="${GROUP_LOOKUP[$group]:+$GROUP_LOOKUP[$group] }$market"
 		done
 
-		for alias in ${market_aliases[@]}
-		do
+        # Populate MARKET_LOOKUP
+		for alias in ${market_aliases[@]}; do
+            # Only add if alias doesn't already exist (first match wins)
 			MARKET_LOOKUP[$alias]="${MARKET_LOOKUP[$alias]:-$market}"
 		done
-	done
+	done <<< "$current_markets_json"
 }
 
-function create_identifiers_lookup() {
-	if ! defaults read "$DOMAIN" 'identifiers' &>/dev/null
-	then
-		defaults write "$DOMAIN" 'identifiers' &>/dev/null
+#
+# Loads identifier lookup tables (partner, offer, etc.) from 'defaults'.
+# If they don't exist, populates them with default data.
+#
+function load_identifier_lookups() {
+    # Ensure the base 'identifiers' dictionary exists
+	if ! defaults read "$SCRIPT_DOMAIN" 'identifiers' &>/dev/null; then
+		defaults write "$SCRIPT_DOMAIN" 'identifiers' -dict "{}"
 	fi
 
-	local DB=$(defaults read "$DOMAIN" 'identifiers' 2>/dev/null | plutil -convert json -o - -)
+	local identifiers_db_json
+    identifiers_db_json=$(defaults read "$SCRIPT_DOMAIN" 'identifiers' 2>/dev/null | plutil -convert json -o - -)
 
-	if ! jq -e '.partners' <<< "$DB" &>/dev/null
-	then
+    # --- Populate Partners ---
+	if ! jq -e '.partners' <<< "$identifiers_db_json" &>/dev/null; then
+		local default_partners_data='Linear:01. Linear:linear
+CTV:CTV:ctv
+Youtube:Youtube:you[^[:alnum:]]?tube
+companionBanner:Youtube:companion[^[:alnum:]]?banner
+DV360:DV360:dv[^[:alnum:]]?360
+RTB:RTB House:rtb
+Pmax:PMAX:pmax
+inFeed:Meta:in[^[:alnum:]]?feed
+Story:Meta:story
+Meta:Meta:meta
+Reddit:Reddit:reddit
+Pinterest:Pinterest:pinterest
+TikTok:TikTok:tik[^[:alnum:]]?tok
+Discovery:Responsive Discovery:discovery
+Responsive:Responsive Discovery:responsive
+HTML:HTML:html, html[^[:alnum:]]?5
+liveIntent:Live Intent:liveintent, live[^[:alnum:]]?intent
+Native:Native:native
+Criteo:Criteo:criteo
+customerReview:Customer Review:customer[^[:alnum:]]?review
+Snapchat:Snapchat:snap[^[:alnum:]]?chat'
 
-		local default_partners_DB='Linear:01. Linear:linear
-CTV:02. CTV:ctv
-Youtube:03. Youtube:you tube
-companionBanner:03. Youtube:companion banner
-DV360:04. DV360:dv 360
-RTB:05. RTB House:rtb
-Pmax:06. PMAX:pmax
-inFeed:07. Meta:in feed
-Story:07. Meta:story
-Meta:07. Meta:meta
-Reddit:08. Reddit:reddit
-Pinterest:09. Pinterest:pinterest
-TikTok:10. TikTok:tik tok
-Discovery:11. Responsive Discovery:discovery
-Responsive:11. Responsive Discovery:responsive
-HTML:12. HTML:html, html 5
-liveIntent:13. Live Intent:liveintent, live intent
-Native:14. Native:native
-Criteo:15. Criteo:criteo
-customerReview:16. Customer Review:customer review
-Snapchat:17. Snapchat:snap chat'
+		local partners_db_json=$(echo {} | jq '{}')
+		while IFS=':' read -r name folder alias; do
+			partners_db_json=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$partners_db_json")
+		done  <<< "$default_partners_data"
 
-		local partners_DB=$(echo {} | jq '{}')
-		while IFS=':' read -r name folder alias
-		do
-			partners_DB=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$partners_DB")
-		done  <<< "$default_partners_DB"
-
-		partners_DB=$(echo $partners_DB | plutil -convert xml1 -o - -)
-		defaults write "$DOMAIN" identifiers -dict-add "partner" "$partners_DB"
+		partners_db_json=$(echo $partners_db_json | plutil -convert xml1 -o - -)
+		defaults write "$SCRIPT_DOMAIN" identifiers -dict-add "partner" "$partners_db_json"
 	fi
 
-	if ! jq -e '.htmlPublisher' <<< "$DB" &>/dev/null
-	then
+    # --- Populate HTML Publishers ---
+	if ! jq -e '.htmlPublisher' <<< "$identifiers_db_json" &>/dev/null; then
+		local default_html_publishers_data='theTradeDesk:The Trade Desk:the[^[:alnum:]]?trade[^[:alnum:]]?desk, trade[^[:alnum:]]?desk
+campaignManager360:Campaign Manager 360:campaign[^[:alnum:]]?manager[^[:alnum:]]?360, campaign[^[:alnum:]]?manager, manager[^[:alnum:]]?360
+pmaxBanner:PMAX Banners:pmax[^[:alnum:]]?banner'
 
-		local default_HTML_Publishers_DB='theTradeDesk:The Trade Desk:the trade desk, trade desk
-campaignManager360:Campaign Manager 360:campaign manager 360, campaign manager, manager 360
-pmaxBanner:PMAX Banners:pmax banner'
+		local html_publishers_db_json=$(echo {} | jq '{}')
+		while IFS=':' read -r name folder alias; do
+			html_publishers_db_json=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$html_publishers_db_json")
+		done  <<< "$default_html_publishers_data"
 
-		local html_publishers_DB=$(echo {} | jq '{}')
-		while IFS=':' read -r name folder alias
-		do
-			html_publishers_DB=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$html_publishers_DB")
-		done  <<< "$default_HTML_Publishers_DB"
-
-		html_publishers_DB=$(echo $html_publishers_DB | plutil -convert xml1 -o - -)
-		defaults write "$DOMAIN" identifiers -dict-add "htmlPublishers" "$html_publishers_DB"
+		html_publishers_db_json=$(echo $html_publishers_db_json | plutil -convert xml1 -o - -)
+		defaults write "$SCRIPT_DOMAIN" identifiers -dict-add "htmlPublishers" "$html_publishers_db_json"
 	fi
 
-	if ! jq -e '.offer' <<< "$DB" &>/dev/null
-	then
-		local default_offers_DB='NCO:NCO:NCO, newcustomerOffer, new customer Offer
-Offer:Offer:Offer, Offer[0-9]+, Offer [0-9]+
-noOffer:noOffer:noOffer, no Offer'
+    # --- Populate Offers ---
+	if ! jq -e '.offer' <<< "$identifiers_db_json" &>/dev/null; then
+		local default_offers_data='NCO:New Customer Offer:NCO, new[^[:alnum:]]?customer[^[:alnum:]]?Offer
+Offer:Offer:[^[:alnum:]]Offer[^[:alnum:]], [^[:alnum:]]Offer[^[:alnum:]]?[0-9]+[^[:alnum:]]
+noOffer:No Offer:[^[:alnum:]]no[^[:alnum:]]?Offer[^[:alnum:]]'
 
-		local offers_DB=$(echo {} | jq '{}')
-		while IFS=':' read -r name folder alias
-		do
-			offers_DB=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$offers_DB")
-		done  <<< "$default_offers_DB"
+		local offers_db_json=$(echo {} | jq '{}')
+		while IFS=':' read -r name folder alias; do
+			offers_db_json=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$offers_db_json")
+		done  <<< "$default_offers_data"
 
-		offers_DB=$(echo $offers_DB | plutil -convert xml1 -o - -)
-		defaults write "$DOMAIN" identifiers -dict-add "offer" "$offers_DB"
+		offers_db_json=$(echo $offers_db_json | plutil -convert xml1 -o - -)
+		defaults write "$SCRIPT_DOMAIN" identifiers -dict-add "offer" "$offers_db_json"
 	fi
 
-	DB=$(defaults read "$DOMAIN" 'identifiers' 2>/dev/null | plutil -convert json -o - -)
-	eval $(jq -r 'to_entries[] | "IDENTIFERS[\(.key|@json)]=" + ([.value[].alias | gsub(", "; "|")] | join("|") | @sh)' <<< "$DB")
-	eval $(jq -r 'to_entries[] | .value[] | .name as $n | (.alias | split(", "))[] | "IDENTIFERS_NAMES[\(.|@json)]=\($n|@sh)"' <<< "$DB")
-	eval $(jq -r 'to_entries[] | .value[] | .folder as $f | (.alias | split(", "))[] | "IDENTIFERS_FOLDERS[\(.|@json)]=\($f|@sh)"' <<< "$DB")
+	if ! jq -e '.DPA' <<< "$identifiers_db_json" &>/dev/null; then
+		local default_DPA_data='DPA:DPA:DA'
+
+		local DPA_db_json=$(echo {} | jq '{}')
+		while IFS=':' read -r name folder alias; do
+			DPA_db_json=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$DPA_db_json")
+		done  <<< "$default_DPA_data"
+
+		DPA_db_json=$(echo $DPA_db_json | plutil -convert xml1 -o - -)
+		defaults write "$SCRIPT_DOMAIN" identifiers -dict-add "DPA" "$DPA_db_json"
+	fi
+
+	if ! jq -e '.version' <<< "$identifiers_db_json" &>/dev/null; then
+		local default_version_data='Version:Version:V[^[:alnum:]]?[0-9]+, Version[^[:alnum:]]?[0-9]+, VER[^[:alnum:]]?[0-9]+'
+
+		local version_db_json=$(echo {} | jq '{}')
+		while IFS=':' read -r name folder alias; do
+			version_db_json=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$version_db_json")
+		done  <<< "$default_version_data"
+
+		version_db_json=$(echo $version_db_json | plutil -convert xml1 -o - -)
+		defaults write "$SCRIPT_DOMAIN" identifiers -dict-add "version" "$version_db_json"
+	fi
+
+	if ! jq -e '.round' <<< "$identifiers_db_json" &>/dev/null; then
+		local default_round_data='Round:Round:R[^[:alnum:]]?[0-9]+, Round[^[:alnum:]]?[0-9]+, RND[^[:alnum:]]?[0-9]+, RD[^[:alnum:]]?[0-9]+'
+
+		local round_db_json=$(echo {} | jq '{}')
+		while IFS=':' read -r name folder alias; do
+			round_db_json=$(jq --arg name "$name" --arg folder "$folder" --arg alias "$alias" '. += { ($name): { name: $name, folder: $folder, alias: $alias }}' <<< "$round_db_json")
+		done  <<< "$default_round_data"
+
+		round_db_json=$(echo $round_db_json | plutil -convert xml1 -o - -)
+		defaults write "$SCRIPT_DOMAIN" identifiers -dict-add "round" "$round_db_json"
+	fi
+
+    # --- Populate ZSH Lookup Tables ---
+    # Read the complete identifiers DB again (now with defaults)
+	identifiers_db_json=$(defaults read "$SCRIPT_DOMAIN" 'identifiers' 2>/dev/null | plutil -convert json -o - -)
+
+    # Use 'eval' to dynamically build ZSH associative arrays from the JSON data
+    # IDENTIFIER_TYPE_ALIASES['partner'] = "linear|ctv|you tube|..."
+	eval "$(jq -r 'to_entries[] | .key as $k | [.value[].alias | gsub(", "; "|")] | join("|") as $a | "IDENTIFIER_TYPE_ALIASES[\($k)]=\"\($a)\""' <<< "$identifiers_db_json")"
+    # IDENTIFIER_ALIAS_TO_NAME['you tube'] = "Youtube"
+	eval "$(jq -r 'to_entries[] | .value[] | .name as $n | (.alias | split(", "))[] | "IDENTIFIER_ALIAS_TO_NAME[\"\(.)\"]=\"\($n)\""' <<< "$identifiers_db_json")"
+    # IDENTIFIER_ALIAS_TO_FOLDER['you tube'] = "03. Youtube"
+	eval "$(jq -r 'to_entries[] | .value[] | .folder as $f | (.alias | split(", "))[] | "IDENTIFIER_ALIAS_TO_FOLDER[\"\(.)\"]=\"\($f)\""' <<< "$identifiers_db_json")"
 }
 
-function create_export_lookup() {
-	if ! defaults read "$DOMAIN" 'export' &>/dev/null
-	then
-		# echo notFOund
-		defaults write "$DOMAIN" 'export' &>/dev/null
+#
+# Loads export rules (name/folder templates) from 'defaults'.
+# If they don't exist, populates them with default data.
+#
+function load_export_lookups() {
+    # Ensure the base 'export' dictionary exists
+	if ! defaults read "$SCRIPT_DOMAIN" 'export' &>/dev/null; then
+		defaults write "$SCRIPT_DOMAIN" 'export' -dict "{}"
+
+        # Default data: Filter:NameTemplate:FolderTemplate
+		local default_export_rules_data='DEFAULT:MARKET_TICKET_partner.name_FORMAT_offer.match_version.match_SIZE_INDEX:/round.match/MARKET/partner.folder/offer.match
+partner.name=Pinterest, DPA.name:MARKET_TICKET_partner.name_DPA.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match
+partner.name=Responsive:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner.name=Discovery:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner.name=Responsive, size=960x1200:MARKET_TICKET_Discovery_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner.name=Discovery, size=960x1200:MARKET_TICKET_Discovery_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/SIZE
+partner.name=companionBanner:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/youtube
+partner.name=HTML, FORMAT=Static:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/preview
+partner.name=HTML, htmlPublishers:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/htmlPublishers.folder'
 
 
-		local default_export='DEFAULT:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER
-partner=Responsive:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=Discovery:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=Responsive, size=960x1200:MARKET_TICKET_Discovery_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=Discovery, size=960x1200:MARKET_TICKET_Discovery_FORMAT_SIZE_INDEX:/MARKET/PARTNER/SIZE
-partner=companionBanner:MARKET_TICKET_PARTNER_FORMAT_SIZE_INDEX:/MARKET/PARTNER/youtube'
-
-		while IFS=':' read -r filter name folder
-		do
-			defaults write "$DOMAIN" export -dict-add "$filter" "{ name = "$name"; folder = "$folder"; }"
-		done <<< $default_export
+		while IFS=':' read -r filter name folder; do
+			defaults write "$SCRIPT_DOMAIN" export -dict-add "$filter" "{ name = \"$name\"; folder = \"$folder\"; }"
+		done <<< $default_export_rules_data
 	fi
 
-	local DB=$(defaults read "$DOMAIN" 'export' 2>/dev/null | plutil -convert json -o - -)
+	local export_db_json
+    export_db_json=$(defaults read "$SCRIPT_DOMAIN" 'export' 2>/dev/null | plutil -convert json -o - -)
 
-	EXPORT_FILTERS=(${(f)"$(jq -r 'to_entries[] | .key' <<< $DB)"})
-	EXPORT_FILTERS=("${(@)$(for s in "${EXPORT_FILTERS[@]}"; do
-		words=(${(s:,:)s})
-		count=${#words[@]}
-		echo "$count $s"
+    # --- Populate ZSH Lookup Tables ---
+
+    # Get all filter keys
+	EXPORT_FILTERS=(${(f)"$(jq -r 'to_entries[] | .key' <<< $export_db_json)"})
+    # Sort filters by specificity (most conditions first)
+    # This ensures "partner=X, size=Y" is checked before "partner=X"
+	EXPORT_FILTERS=("${(@)$(for filter_string in "${EXPORT_FILTERS[@]}"; do
+		local conditions=(${(s:,:)filter_string})
+		local count=${#conditions[@]}
+		echo "$count $filter_string"
 	done | sort -nr | cut -d' ' -f2-)}")
 
-	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_NAME[\($k|@sh)]=\(.value.name|@sh)"' <<< "$DB")
-	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_FOLDER[\($k|@sh)]=\(.value.folder|@sh)"' <<< "$DB")
+    # Populate the name and folder template lookup tables
+	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_NAME_TEMPLATES[\"\($k)\"]=\"\(.value.name)\""' <<< $export_db_json)
+	eval $(jq -r 'to_entries[] | .key as $k | "EXPORT_FOLDER_TEMPLATES[\"\($k)\"]=\"\(.value.folder)\""' <<< $export_db_json)
 }
 
-#region
-function get_markets() {
-	local name="$1"
-	typeset -U markets=()
+#
+# Displays a warning dialog to the user.
+# $1: The message to display.
+#
+function show_warning_dialog() {
+    local message="$1"
+    osascript -e "tell application \"System Events\" to display dialog \"$message\" with title \"Asset Organizer Script\" with icon caution buttons {\"OK\"} default button \"OK\""
+}
 
-	name="${name//[^[:alnum:]]/ }"
-	name=${(U)name}
-	name=(${(s: :)name})
+#
+# Displays a macOS notification.
+# $1: Title
+# $2: Subtitle
+# $3: Body
+#
+function show_notification() {
+    local title="$1"
+    local subtitle="$2"
+    local body="$3"
+    osascript -e "display notification \"$body\" with title \"$title\" subtitle \"$subtitle\""
+}
 
-	for (( i=1; i<=${#name[@]}; i++ ))
-	do
-		local curr="${name[$i]}"
-		[[ -z "$curr" ]] && break
-		local next="${name[(( i+1 ))]}"
+#
+# Gets destination folder and ticket ID, preferring stored values
+# for the given source directories. If not found, prompts the user
+# and stores the new values.
+#
+function get_dest_and_ticket() {
+	local input=($SOURCE_DIRECTORIES)
+	local default_path="${input[1]}" # Use the first source directory as default
+	local target ticket
+	typeset -A destination_folders tickets
 
-		[[ -n $GROUP_LOOKUP[$curr] ]] && markets+=(${(s: :)GROUP_LOOKUP[$curr]}) && continue
-		[[ -n $MARKET_LOOKUP[$curr$next] && -n "$next" ]] && markets+=($MARKET_LOOKUP[$curr$next]) && (( i++ )) && continue
-		[[ -n $MARKET_LOOKUP[$curr] ]] && markets+=(${MARKET_LOOKUP[$curr]}) && continue
+	local DB=$(defaults read $SCRIPT_DOMAIN destination 2>/dev/null | plutil -convert json -o - -)
+	# If DB is empty, initialize it
+	[[ -z "$DB" ]] && DB="{}"
+
+	local jq_input=$(jq -n --null-input '$ARGS.positional' --args -- "${input[@]}")
+
+	eval $(jq -r --argjson keys "$jq_input" 'to_entries[] | .key as $k | select($keys | index($k)) | .value.dest as $d | "destination_folders[\"\($k)\"]=\"\($d)\""' <<< $DB)
+	eval $(jq -r --argjson keys "$jq_input" 'to_entries[] | .key as $k | select($keys | index($k)) | .value.ticket as $t | "tickets[\"\($k)\"]=\"\($t)\""' <<< $DB)
+
+	input=(${(s: :)$(printf '"%s" ' ${(@)input})})
+    # Check if all source directories have a *single* consistent stored destination and ticket
+	if [[ ${(j: :)${(ko)destination_folders}} == ${(j: :)${(o)input}} && \
+		  ${(j: :)${(ko)tickets}} == ${(j: :)${(o)input}} && \
+		  ${#${(vu)tickets}} == 1 && \
+		  ${#${(vu)destination_folders}} == 1 ]]; then
+
+		target=${(vu)destination_folders[@]}
+		ticket=${(vu)tickets[@]}
+
+		if [[ -d "$target" ]]; then
+			DESTINATION_BASE_DIR=$target
+			TICKET_ID=$ticket
+			return
+		fi
+	fi
+	
+    # If no stored values or they are inconsistent, prompt user
+	target=$(osascript -e 'on run(argv)
+        set defaultPath to POSIX file (item 1 of argv)
+        tell application "System Events"
+            activate
+            set selectedFolder to (choose folder with prompt "Please select the destination folder:" default location defaultPath)
+            set posixPath to POSIX path of selectedFolder
+            return posixPath
+        end tell
+    end run' "${default_path:h}")
+    # Exit if user cancelled folder selection
+    if [[ -z "$target" ]]; then
+        show_warning_dialog "User cancelled folder selection. Exiting."
+        return 1
+    fi
+
+	ticket=$(osascript -e 'tell application "System Events"
+activate
+set dialog_result to display dialog "Please enter the Ticket/Campaign ID:" default answer "TIX-XXX"
+set ticket to text returned of dialog_result
+return ticket
+end tell')
+    # Exit if user cancelled ticket input
+    if [[ -z "$ticket" ]]; then
+        show_warning_dialog "User cancelled ticket input. Exiting."
+        return 1
+    fi
+
+    # Store these new values for all current source directories
+	local update_obj=$(jq -n \
+	--argjson paths "$jq_input" \
+	--arg dest "$target" \
+	--arg ticket "$ticket" \
+	'reduce $paths[] as $path ({}; . + { ($path): {dest: $dest, ticket: $ticket} })'
+	)
+	
+	local new_db=$(jq -n \
+	--argjson old "$DB" \
+	--argjson new "$update_obj" \
+	'$old + $new'
+	)
+	
+	local plist_data=$(plutil -convert xml1 -o - - <<< "$new_db")
+	defaults write "$SCRIPT_DOMAIN" destination "$plist_data"
+	
+	# Set the global variables
+	[[ -d $target ]] && DESTINATION_BASE_DIR=$target
+	[[ -n $ticket ]] && TICKET_ID=$ticket
+}
+#endregion
+
+#region == File Tagging Functions ==
+
+#
+# Gets all parent directories of a file up to the source root.
+# $...: A list of file paths.
+#
+function get_parents() {
+	local files=$@
+	typeset -U paths
+
+	files=(${(f)files})
+	for p in ${(@)files}; do
+		until [[ "$p" == "/" ]] || [[ "$p" == "$HOME" ]] || [[ "$SOURCE_DIRECTORIES" =~ $p ]]; do
+			paths+=($p)
+			p=${p:h}
+		done
+
+		[[ "$SOURCE_DIRECTORIES" =~ $p ]] && paths+=($p)
+	done
+
+	print -l ${(@)paths}
+}
+
+#
+# Adds or removes macOS Finder tags from a list of files/folders.
+# $1: The tag name (e.g., "Red", "Orange") or "NONE" to remove all tags.
+# $...: A list of file paths to tag.
+#
+function add_tag() {
+	local tag="$1"
+	local comment="$2"
+	shift
+	shift
+	local paths=$(get_parents $@)
+    [[ -z "$paths" ]] && return # Do nothing if no paths
+
+#region apple script
+	osascript <<EOF
+use framework "Foundation"
+use scripting additions
+
+set allLines to paragraphs of "${(@)paths}"
+tell application "Finder"
+	repeat with path in allLines
+		log path
 		
+		set filePathStr to contents of path
+		set targetFile to (POSIX file filePathStr) as alias
+
+		if "$comment" = "" or "${(U)comment}" = "NONE" then
+			set comment of targetFile to ""
+		else
+			set currentComment to comment of targetFile
+			set toAdd to "$comment"
+
+			set newComment to my format_debug_comment(currentComment, toAdd)
+			set comment of targetFile to newComment
+		end if
+		
+		if "${(U)tag}" = "NONE" then
+			my removeTags(path)
+		else
+			my addTag("$tag", path)
+		end if
+
+	end repeat
+end tell
+
+on addTag(tagName, filePath)
+	-- Convert file path to NSURL
+	set u to current application's |NSURL|'s fileURLWithPath:filePath
+	
+	-- Get existing tags
+	set {theResult, theTags} to u's getResourceValue:(reference) forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+	
+	if theTags is not missing value then
+		-- Merge existing tags with new tag
+		set tagList to (theTags as list) & {tagName}
+		-- Remove duplicates
+		set tagList to (current application's NSOrderedSet's orderedSetWithArray:tagList)'s allObjects()
+	else
+		-- If no existing tags, just use the new tag
+		set tagList to {tagName}
+	end if
+	
+	-- Set the updated tag list
+	u's setResourceValue:tagList forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+end addTag
+
+
+on removeTags(filePath)
+	-- Get NSURL for the file
+	set u to current application's |NSURL|'s fileURLWithPath:filePath
+	
+	-- Get current tags
+	set {theResult, theTags} to u's getResourceValue:(reference) forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+	
+	if theTags is not missing value then
+		-- Convert to NSMutableArray
+		set tagArray to (current application's NSMutableArray's arrayWithArray:theTags)
+		
+		-- Remove all tags
+		tagArray's removeAllObjects()
+		
+		-- Apply the empty list
+		u's setResourceValue:tagArray forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+	end if
+end removeTags
+
+on format_debug_comment(currentComment, toAdd)
+    -- 1. Return empty string if either is empty or toAdd already exists
+    if currentComment is "" and toAdd is "" then return ""
+    if toAdd is "" then return currentComment
+    if currentComment contains toAdd then return currentComment
+    
+    -- 2. Remove "missing: " prefix if it exists
+    set prefix to "missing: "
+    if currentComment starts with prefix then
+        set currentComment to text ((length of prefix) + 1) thru -1 of currentComment
+    end if
+    
+    -- 3. Split on ", " into a list
+    set AppleScript's text item delimiters to ", "
+    set commentList to text items of currentComment
+    
+    -- 4. Append new word
+    set end of commentList to toAdd
+    
+    -- 5. Join back into a string
+    set AppleScript's text item delimiters to ", "
+    set currentComment to commentList as text
+    
+    -- 6. Add prefix back
+    set currentComment to prefix & currentComment
+    
+    return currentComment
+end format_debug_comment
+EOF
+#endregion
+}
+#endregion
+
+#region == Metadata Parsing Functions ==
+
+#
+# Finds which source directory (from $SOURCE_DIRECTORIES) a file belongs to.
+# $1: The file path.
+#
+function get_root_folder() {
+	local file="$1"
+
+	for root in ${(@)SOURCE_DIRECTORIES}; do
+		[[ "$file" == "$root"/* ]] && echo "$root" && return 0
+	done
+
+	echo ""
+}
+
+#
+# Attempts to find market codes from a string (e.g., a filename).
+# $1: The string to parse.
+#
+function get_markets() {
+	local path_component="$1"
+	typeset -U markets=() # Unique array
+
+    # Clean and uppercase the string
+	path_component="${path_component//[^[:alnum:]]/ }"
+	path_component=${(U)path_component}
+	path_component=(${(s: :)path_component}) # Split into words
+
+	for (( i=1; i<=${#path_component[@]}; i++ )); do
+		local current_word="${path_component[$i]}"
+		[[ -z "$current_word" ]] && break
+		local next_word="${path_component[(( i+1 ))]}"
+
+        # 1. Check if the word is a Group (e.g., "NA")
+		[[ -n $GROUP_LOOKUP[$current_word] ]] && markets+=(${(s: :)GROUP_LOOKUP[$current_word]}) && continue
+        # 2. Check if the current and next word form a combined alias (e.g., "US EN")
+		[[ -n $MARKET_LOOKUP[$current_word$next_word] && -n "$next_word" ]] && markets+=($MARKET_LOOKUP[$current_word$next_word]) && (( i++ )) && continue
+        # 3. Check if the current word is a simple alias (e.g., "UK")
+		[[ -n $MARKET_LOOKUP[$current_word] ]] && markets+=(${MARKET_LOOKUP[$current_word]}) && continue
+		
+        # If none matched, stop parsing for markets
 		break
 	done
 
 	echo "${markets[@]}"
 }
 
+#
+# Gets the asset format (Static, Video, HTML) based on extension or MIME type.
+# $1: The filepath.
+#
 function get_format() {
-	local file="$1"
-	local mime_type
+	local filepath="$1"
+	local extension="$2"
+	local format=""
 
-	mime_type=$(file --brief --mime-type "$file")
-
-	case "${mime_type}" in
-		image/*) echo "Static" ;;
-		video/*) echo "Video" ;;
-		application/zip)
-			if unzip -l "$file" | grep -iq '\.html$' >/dev/null 2>&1; then
-				echo "HTML"
-			else
-				echo ""
+	if [[ -n $extension ]]; then
+		case "$extension" in
+		(png|jpg|jpeg|psd|tiff|gif)) format="Static" ;;
+		(mp4|mov)) format="Video" ;;
+		zip)
+			if unzip -l "$filepath" | grep -iq '\.html$' >/dev/null 2>&1; then
+				format="HTML"
 			fi
 			;;
-		*) echo "" ;;
-	esac
+		*) format="" ;; # Unknown format
+		esac
+	fi
+
+	if [[ -z "$format" && -z "$extension" ]]; then
+		local mime_type
+		mime_type=$(file --brief --mime-type "$filepath")
+
+		case "${mime_type}" in
+			image/*) format="Static" ;;
+			video/*) format="Video" ;;
+			application/zip)
+				if unzip -l "$filepath" | grep -iq '\.html$' >/dev/null 2>&1; then
+					format="HTML"
+				fi
+				;;
+			*) format="" ;; # Unknown format
+		esac
+	fi
+
+	echo "$format"
 }
 
+#
+# Gets the asset size (e.g., "1920x1080").
+# $1: The filepath.
+# $2: The format (from get_format).
+#
 function get_size() {
-	local file="$1"
+	local filepath="$1"
 	local format="$2"
-	local resolution
+	local resolution=""
 
-	if [[ "${file##*/}" =~ ([0-9]+x[0-9]+) ]]; then
+    # 1. Try to find "WIDTHxHEIGHT" in the filename first
+	if [[ "${filepath##*/}" =~ ([0-9]+x[0-9]+) ]]; then
 		resolution="${match[1]}"
 		echo "$resolution"
 		return
 	fi
 
+    # 2. If it's a Static image, use 'sips' to get dimensions
 	if [[ -z "$resolution" && "$format" == 'Static' ]]; then
-		local dimensions=$(sips -g pixelWidth -g pixelHeight "$file" 2>/dev/null)
+		local dimensions
+        dimensions=$(sips -g pixelWidth -g pixelHeight "$filepath" 2>/dev/null)
 		local width=${${dimensions##*pixelWidth: }%%$'\n'*}
 		local height=${${dimensions##*pixelHeight: }%%$'\n'*}
 		resolution="${width}x${height}"
+        # Ensure sips returned valid data
 		[[ "$resolution" =~ ^([0-9]+x[0-9]+)$ ]] && echo "$resolution"
 		return
 	fi
 
+    # 3. Fallback: no size found
 	echo ""
 }
 
+#endregion
+
+#region == Core Processing Function ==
+
+#
+# Parses a single file to find all metadata, determines the
+# correct export name and folder, and copies the file.
+# $1: The filepath to parse.
+#
 function parse_file() {
-	local file="$1"
+	local filepath="$1"
 	local errors=()
+	local root=$(get_root_folder "$file")
 
-	typeset -A file_identifiers
-	file_identifiers[NAME]="${file##*/}"
-	file_identifiers[EXTENSION]="${file##*.}"
+    # This array will hold all discovered metadata for the file
+	typeset -A asset_metadata
+	asset_metadata[NAME]="${filepath##*/}"
+	asset_metadata[EXTENSION]="${filepath##*.}"
 
-	file_identifiers[MARKETS]=""
-	file_identifiers[FORMAT]=$(get_format "$file")
-	file_identifiers[SIZE]=$(get_size "$file" "$file_identifiers[FORMAT]")
+	asset_metadata[INDEX]=""
+	local index_regex='_([0-9]{2})\.'$asset_metadata[EXTENSION]'$'
+	if [[ "$asset_metadata[NAME]" =~ $index_regex ]]; then
+		asset_metadata[INDEX]="${match[1]}"
+	fi
 
-	setopt nocasematch
-	local curr_file="$file"
-	while [[ "$curr_file" != "$HOME" ]]
-	do
-		[[ -z $file_identifiers[MARKETS] ]] && file_identifiers[MARKETS]=$(get_markets "${curr_file##*/}")
+    # Get metadata from file content/properties
+	asset_metadata[MARKETS]=""
+	asset_metadata[FORMAT]=$(get_format "$filepath" "$asset_metadata[EXTENSION]" )
+	asset_metadata[SIZE]=$(get_size "$filepath" "$asset_metadata[FORMAT]")
 
-		for k in ${(k)IDENTIFERS}; do
-			for al in ${(s:|:)IDENTIFERS[$k]}; do
-				if [[ "${curr_file##*/}" =~ .*(${al// /[^[:alnum:]]?}) ]]; then
-					local key=${k//\"/}
-					key=${(U)key}
-					file_identifiers[$key]=$al
+	setopt nocasematch # Enable case-insensitive matching
+	local current_path_level="$filepath"
+    # Walk up the directory tree from the file
+	while [[ "$current_path_level" != "$HOME" && "$current_path_level" != "/" && "$current_path_level" != "$root" ]]; do
+        # Try to get markets from the current path component (filename or dir name)
+        # Only set markets once
+		[[ -z $asset_metadata[MARKETS] ]] && asset_metadata[MARKETS]=$(get_markets "${current_path_level##*/}")
+
+        # Check for all other identifiers (partner, offer, etc.)
+		for identifier_type alias_regex_string in ${(kv)IDENTIFIER_TYPE_ALIASES}; do
+			[[ -n $asset_metadata[$identifier_type] ]] && continue
+			asset_metadata[$identifier_type]=""
+			asset_metadata[${identifier_type}.name]=""
+			asset_metadata[${identifier_type}.folder]=""
+			asset_metadata[${identifier_type}.match]=""
+			
+			for alias in ${(s:|:)alias_regex_string}; do
+				if [[ "${current_path_level##*/}" =~ ($alias) ]]; then
+					asset_metadata[$identifier_type]="$alias"
+					asset_metadata[${identifier_type}.name]="$IDENTIFIER_ALIAS_TO_NAME["$alias"]"
+					asset_metadata[${identifier_type}.folder]="$IDENTIFIER_ALIAS_TO_FOLDER["$alias"]"
+					asset_metadata[${identifier_type}.match]="$match[1]"
 					break
 				fi
 			done
 		done
 
-		[[ ${#${(k)file_identifiers}} == ${#${(v)file_identifiers}} ]] && break
-		curr_file=$(dirname "$curr_file")
+        # Stop walking up if all metadata keys have been found
+        # Note: This check is a bit loose but acts as an optimization
+		[[ ${#${(k)asset_metadata}} == ${#${(v)asset_metadata}} ]] && break
+		current_path_level=${current_path_level:h}
 	done
 	unsetopt nocasematch
 
-	[[ "${file##*/}" =~ '_([0-9]{2})\.' ]] && file_identifiers[INDEX]="${match[1]}" || file_identifiers[INDEX]=""
+    # --- Validate essential metadata ---
+	[[ -z $asset_metadata[MARKETS] ]] && errors+=(MARKETS)
+	[[ -z $asset_metadata[partner] ]] && errors+=(PARTNER)
+	[[ -z $asset_metadata[FORMAT] ]] && errors+=(FORMAT)
+	[[ -z $asset_metadata[SIZE] ]] && errors+=(SIZE)
 
-	[[ -z $file_identifiers[MARKETS] ]] && errors+=(MARKETS)
-	[[ -z $file_identifiers[PARTNER] ]] && errors+=(PARTNER)
-	[[ -z $file_identifiers[FORMAT] ]] && errors+=(FORMAT)
-	[[ -z $file_identifiers[SIZE] ]] && errors+=(SIZE)
-	[[ -n $errors ]] && echo "ERR::$file::${errors[*]}" && return 0
+	if [[ -n $errors ]]; then
+		echo "ERR::$filepath::${${errors[*]}// /::}::"
+		return 0 # Return success to not stop the loop
+	fi
 
-	function filter_check() {
-		local filter="$1"
-		local condition
+	local asset_metadata_array=()
+	for metadata_key in ${(k)asset_metadata}; do
+		[[ -z ${asset_metadata[$metadata_key]} ]] && continue
+		asset_metadata_array+=( "$metadata_key" "$metadata_key=${asset_metadata[$metadata_key]}" )
+	done
 
-		for condition in ${(s:, :)filter}; do
-			local key=${condition%%=*}
-			key=${(U)key}
-			local value="" && [[ $condition == *=* ]] && value=${condition##*=}
+    # Find the most specific export rule that matches the asset
+	local matched_rule="DEFAULT"
+	for rule in ${(f)EXPORT_FILTERS[@]}; do
+		[[ $rule == "DEFAULT" ]] && continue
 
-			local identifier="$file_identifiers[$key]"
-			[[ $key =~ (SIZE|NAME|MARKET|FORMAT|INDEX|EXTENSION) ]] || identifier="$IDENTIFERS_NAMES["$identifier"]"
+		local conditions=(${(s:, :)rule})
+		local intersection=( ${asset_metadata_array:*conditions} )
 
-			identifier="${(U)identifier}"
-			value="${(U)value}"
-			
-			if ! [[ ( "$identifier" =~ "$value" && -n "$value" ) || ( -z "$value" && -n "$identifier" ) ]]; then
-				return 1
-			fi
-		done
-
-		return 0
-	}
-
-	selected_filter='DEFAULT'
-	for filter in ${(f)${EXPORT_FILTERS[@]}}; do
-		[[ $filter == 'DEFAULT' ]] && continue
-
-		if filter_check "$filter"
-		then
-			selected_filter="$filter"
+		if (( ${#intersection[@]} == ${#conditions[@]} )) && [[ ${(j: :)${(o)intersection}} == ${(j: :)${(o)conditions}} ]]; then
+			matched_rule="$rule"
 			break
 		fi
 	done
 
-	selected_filter="'${selected_filter}'"
-	local nameTemplate=${EXPORT_NAME[$selected_filter]}
-	local folderTemplate=${EXPORT_FOLDER[$selected_filter]}
+	#region --- Export File Based on Matched Rule ---
+	local name_template="$EXPORT_NAME_TEMPLATES["$matched_rule"]"
+	local folder_template="$EXPORT_FOLDER_TEMPLATES["$matched_rule"]"
+	
+	# Loop over each resolved market for this asset (can be multiple)
+	for market in ${(s: :)asset_metadata[MARKETS]}; do
+		# Start by substituting MARKET and TICKET placeholders in templates
+		local new_name="${name_template//MARKET/$market}"
+		local new_path="${folder_template//MARKET/$market}"
+		new_name=${new_name//TICKET/$TICKET_ID}
 
-	for market in ${(s: :)file_identifiers[MARKETS]}
-	do
-		local newName=$nameTemplate
-		newName=${newName//_/}
-		newName=${newName//MARKET/${market}_}
-		newName=${newName//TICKET/${TICKET}_}
-
-		local newFolder=$folderTemplate
-		newFolder=${newFolder//MARKET/$market}
-		newFolder=${newFolder//TICKET/$TICKET}
-
-		for k v in ${(kv)file_identifiers}
-		do
-			[[ $k == MARKET ]] && continue
-
-			if [[ $k =~ (SIZE|NAME|MARKET|FORMAT|INDEX|EXTENSION) ]]
-			then
-				newName=${newName//$k/${v:+_$v}}
-				newFolder=${newFolder//$k/$v}
-			else
-				local identifier_name=$IDENTIFERS_NAMES["$v"]
-				local identifier_folder=$IDENTIFERS_FOLDERS["$v"]
-
-				newName=${newName//$k/${identifier_name:+_${identifier_name}}}
-				newFolder=${newFolder//$k/$identifier_folder}
-			fi
+		# Replace name template tokens (separated by underscores) with discovered metadata values.
+		for name_part in ${(s:_:)new_name}; do
+			[[ ${(k)asset_metadata} =~ $name_part ]] || continue
+			new_name=${new_name//$name_part/$asset_metadata[$name_part]}
 		done
 
-		newName=${newName//__/_}
-		newName="${newName}.${file_identifiers[EXTENSION]}"
-		newFolder="$DEST/$newFolder"
+		# Replace path template tokens (separated by slashes) with discovered metadata values.
+		for path_part in ${(s:/:)new_path}; do
+			[[ ${(k)asset_metadata} =~ $path_part ]] || continue
+			new_path=${new_path//$path_part/$asset_metadata[$path_part]}
+		done
 
-		mkdir -p "$newFolder"
-		cp "$file" "$newFolder/$newName"
+		# Clean up obvious formatting artifacts:
+		new_name=${new_name//(#m)_##/_}
+		new_name=${new_name%_}
+		new_name=${new_name//HTML_HTML/HTML}
+		new_name="${new_name}.$asset_metadata[EXTENSION]"
 
-		echo "OK::${file##*/}::${newFolder}::${newName}"
+		new_path="${DESTINATION_BASE_DIR}/${new_path}"
+		new_path=${new_path//(#m)\/##/\/}
+		new_path=${new_path%\/}
+
+		# If the exact destination file already exists, emit a warning line
+		if [[ -f "${new_path}/${new_name}" ]]; then
+			echo "WARR::${file}::${new_path}/${new_name}::"
+		else
+			# Running in background avoids blocking; mkdir+cp are IO-bound so this is acceptable.
+			$(mkdir -p "$new_path" && cp -f "$filepath" "${new_path}/${new_name}") &
+			echo "OK::${file}::${new_path}::${new_name}::"
+		fi
 	done
+	#endregion
 }
-#region
-version_check &>/dev/null
-create_markets_lookup &>/dev/null
-create_identifiers_lookup &>/dev/null
-create_export_lookup &>/dev/null
+#endregion
 
-#region
-count=0
-results=$(while read -r file
-do
+#region == Main Execution ==
+
+# Initialize DB and load all lookup tables
+# (Suppress output from init functions)
+echo "Initializing lookups..."
+check_and_update_db_version &>/dev/null
+load_market_lookups &>/dev/null
+load_identifier_lookups &>/dev/null
+load_export_lookups &>/dev/null
+
+# Get or prompt for destination and ticket, exit on user cancel
+get_dest_and_ticket
+if [[ $? -ne 0 ]]; then
+    return 1
+fi
+#endregion
+
+#region == Parallel Processing Loop ==
+
+# Find all files (excluding hidden ones) and process them in parallel
+echo "\nStarting asset organization..."
+echo "Source(s): ${SOURCE_DIRECTORIES[*]}"
+echo "Destination: $DESTINATION_BASE_DIR"
+echo "Ticket: $TICKET_ID"
+echo "Max Processes: $MAX_PROCESSES"
+echo "---"
+
+# WARNING: Clear the destination directory before starting.
+# This ensures a clean export every time.
+[[ -d "$DESTINATION_BASE_DIR" ]] && rm -rf "$DESTINATION_BASE_DIR"/*
+
+# Clear tags from files that were errors in the *previous* run
+old_error_files=$(defaults read $SCRIPT_DOMAIN ERRORS 2>/dev/null)
+add_tag "None" "None" ${old_error_files} &>/dev/null
+
+# 'find' streams files, 'while read' processes them
+# Each 'parse_file' is backgrounded (&)
+setopt extendedglob
+results=$(process_count=0
+while read -r file; do
 	parse_file "$file" &
-	(( count++ ))
+	(( process_count++ ))
 
-	if (( count % MAX_PROCS == 0 )); then
+    # Wait for processes to finish in batches of MAX_PROCESSES
+	if (( process_count % MAX_PROCESSES == 0 )); then
         wait
     fi
-done < <(find "/Users/mohamedaminedhahri/Desktop/Code/Collector/REVIEW" -type f -not -path '*/.*'))
-
-echo "$results" #| column -s '::' -t
-echo
-echo "$results" | grep "ERR" | column -s '::' -t
-
+done < <(find "${(@)SOURCE_DIRECTORIES}" -type f -not -path '*/.*'))
 wait
-echo "count: $count"
+#endregion
+
+#region == Error Reporting & Tagging ==
+
+echo "---"
+echo "Parsing complete. Tagging files with errors..."
+
+# Calculate stats for notification
+local ok_count=$(echo "$results" | grep -c '^OK::')
+local warn_count=$(echo "$results" | grep -c '^WARR::')
+local err_count=$(echo "$results" | grep -c '^ERR::')
+local total_files=$((ok_count + warn_count + err_count))
+
+# Tag files that failed in *this* run
+partner_errors=$(echo $results | awk -F '::' '/^ERR/ && /PARTNER/ {print $2}') && add_tag "Orange" "Partner" ${partner_errors} &>/dev/null &
+format_errors=$(echo $results | awk -F '::' '/^ERR/ && /FORMAT/ {print $2}') && add_tag "Purple" "Format" ${format_errors} &>/dev/null &
+size_errors=$(echo $results | awk -F '::' '/^ERR/ && /SIZE/ {print $2}') && add_tag "Yellow" "Size" ${size_errors} &>/dev/null &
+market_errors=$(echo $results | awk -F '::' '/^ERR/ && /MARKETS/ {print $2}') && add_tag "Red" "Market" ${market_errors} &>/dev/null &
+
+# Store all parent paths of error files for the next run
+error_files=$(echo $results | awk -F '::' '/^ERR/ {print $2}')
+error_files=$(get_parents $error_files)
+
+defaults write $SCRIPT_DOMAIN ERRORS -string "$error_files"
+echo "---"
+echo "Done."
+
+# --- Send Final Notification ---
+local notif_title="Complete: $TICKET_ID"
+local notif_subtitle="Processed $total_files files"
+local notif_body="Errors: $err_count | Duplicates: $warn_count"
+
+show_notification "$notif_title" "$notif_subtitle" "$notif_body"
+#endregion

@@ -1,0 +1,78 @@
+output=$(cat)
+
+input=$(echo $output | awk -F '::' '!/OK/ && !/WARR/ && !/ERR/ {print}')
+input=(${(f)input})
+
+error_paths=$(echo $output | awk -F '::' '/^ERR/ && /MARKETS/ {print $2}')
+error_paths=(${(f)error_paths})
+
+for p in ${(@)error_paths}; do
+	until [[ $p == "/" ]] || [[ "$input" =~ $p ]]; do
+		paths+=($p)
+		p=${p:h}
+	done
+
+	[[ "$input" =~ $p ]] && paths+=($p)
+done
+
+print -l $paths
+
+-----------------------------
+
+use framework "Foundation"
+use scripting additions
+
+on run {input, parameters}
+	
+	set allLines to paragraphs of input
+	
+	repeat with path in input
+		if (length of path) > 0 then
+			my addTag("Red", path)
+			log path
+		end if
+	end repeat
+	
+	return input
+end run
+
+on addTag(tagName, filePath)
+	-- Convert file path to NSURL
+	set u to current application's |NSURL|'s fileURLWithPath:filePath
+	
+	-- Get existing tags
+	set {theResult, theTags} to u's getResourceValue:(reference) forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+	
+	if theTags is not missing value then
+		-- Merge existing tags with new tag
+		set tagList to (theTags as list) & {tagName}
+		-- Remove duplicates
+		set tagList to (current application's NSOrderedSet's orderedSetWithArray:tagList)'s allObjects()
+	else
+		-- If no existing tags, just use the new tag
+		set tagList to {tagName}
+	end if
+	
+	-- Set the updated tag list
+	u's setResourceValue:tagList forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+end addTag
+
+
+on removeTags(filePath)
+	-- Get NSURL for the file
+	set u to current application's |NSURL|'s fileURLWithPath:filePath
+	
+	-- Get current tags
+	set {theResult, theTags} to u's getResourceValue:(reference) forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+	
+	if theTags is not missing value then
+		-- Convert to NSMutableArray
+		set tagArray to (current application's NSMutableArray's arrayWithArray:theTags)
+		
+		-- Remove all tags
+		tagArray's removeAllObjects()
+		
+		-- Apply the empty list
+		u's setResourceValue:tagArray forKey:(current application's NSURLTagNamesKey) |error|:(missing value)
+	end if
+end removeTags
