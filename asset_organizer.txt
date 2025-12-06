@@ -29,7 +29,7 @@ readonly MAX_PROCESSES=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo
 
 # The base directory where organized assets will be copied.
 # This can be overridden by the get_dest_and_ticket function.
-DESTINATION_BASE_DIR="$HOME/Documents/asset Organizer"
+DESTINATION_BASE_DIR="$HOME/Desktop/asset_organizer_FINAL"
 
 # The ticket ID to be embedded in new filenames.
 # This can be overridden by the get_dest_and_ticket function.
@@ -209,7 +209,7 @@ Snapchat:Snapchat:snap[^[:alnum:]]?chat'
 	fi
 
     # --- Populate HTML Publishers ---
-	if ! jq -e '.htmlPublishers' <<< "$identifiers_db_json" &>/dev/null; then
+	if ! jq -e '.htmlPublisher' <<< "$identifiers_db_json" &>/dev/null; then
 		local default_html_publishers_data='theTradeDesk:The Trade Desk:the[^[:alnum:]]?trade[^[:alnum:]]?desk, trade[^[:alnum:]]?desk
 campaignManager360:Campaign Manager 360:campaign[^[:alnum:]]?manager[^[:alnum:]]?360, campaign[^[:alnum:]]?manager, manager[^[:alnum:]]?360
 pmaxBanner:PMAX Banners:pmax[^[:alnum:]]?banner'
@@ -239,7 +239,7 @@ noOffer:No Offer:[^[:alnum:]]no[^[:alnum:]]?Offer[^[:alnum:]]'
 	fi
 
 	if ! jq -e '.DPA' <<< "$identifiers_db_json" &>/dev/null; then
-		local default_DPA_data='DPA:DPA:DPA'
+		local default_DPA_data='DPA:DPA:DA'
 
 		local DPA_db_json=$(echo {} | jq '{}')
 		while IFS=':' read -r name folder alias; do
@@ -263,7 +263,7 @@ noOffer:No Offer:[^[:alnum:]]no[^[:alnum:]]?Offer[^[:alnum:]]'
 	fi
 
 	if ! jq -e '.round' <<< "$identifiers_db_json" &>/dev/null; then
-		local default_round_data='Round:Round:[^[:alnum:]]R[^[:alnum:]]?[0-9]+[^[:alnum:]], [^[:alnum:]]Round[^[:alnum:]]?[0-9]+[^[:alnum:]], [^[:alnum:]]RND[^[:alnum:]]?[0-9]+[^[:alnum:]], [^[:alnum:]]RD[^[:alnum:]]?[0-9]+[^[:alnum:]]'
+		local default_round_data='Round:Round:R[^[:alnum:]]?[0-9]+, Round[^[:alnum:]]?[0-9]+, RND[^[:alnum:]]?[0-9]+, RD[^[:alnum:]]?[0-9]+'
 
 		local round_db_json=$(echo {} | jq '{}')
 		while IFS=':' read -r name folder alias; do
@@ -307,16 +307,6 @@ partner.name=companionBanner:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_
 partner.name=HTML, FORMAT=Static:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/preview
 partner.name=HTML, htmlPublishers:MARKET_TICKET_partner.name_FORMAT_offer.match_SIZE_INDEX:/MARKET/partner.folder/offer.match/htmlPublishers.folder'
 
-# default_export_rules_data='DEFAULT:MARKET_TICKET_partner.name_DPA.name_FORMAT_offer.match_version.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match
-# partner.name=Pinterest, DPA.name:MARKET_TICKET_partner.name_DPA.name_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match
-# partner.name=Responsive:MARKET_TICKET_partner.name_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match/SIZE
-# partner.name=Discovery:MARKET_TICKET_partner.name_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match/SIZE
-# partner.name=Responsive, size=960x1200:MARKET_TICKET_Discovery_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match/SIZE
-# partner.name=Discovery, size=960x1200:MARKET_TICKET_Discovery_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match/SIZE
-# partner.name=companionBanner:MARKET_TICKET_partner.name_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match/youtube
-# partner.name=HTML, FORMAT=Static:MARKET_TICKET_partner.name_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match/preview
-# partner.name=HTML, htmlPublishers:MARKET_TICKET_partner.name_DPA.name_FORMAT_offer.match_SIZE_version.match_INDEX:/MARKET/round.match/partner.folder/offer.match/version.match/htmlPublishers.folder'
-		
 
 		while IFS=':' read -r filter name folder; do
 			defaults write "$SCRIPT_DOMAIN" export -dict-add "$filter" "{ name = \"$name\"; folder = \"$folder\"; }"
@@ -765,14 +755,10 @@ function parse_file() {
 			
 			for alias in ${(s:|:)alias_regex_string}; do
 				if [[ "${current_path_level##*/}" =~ ($alias) ]]; then
-					local name_key="${identifier_type}.name"
-					local folder_key="${identifier_type}.folder"
-					local match_key="${identifier_type}.match"
-
 					asset_metadata[$identifier_type]="$alias"
-					asset_metadata[$name_key]="$IDENTIFIER_ALIAS_TO_NAME["$alias"]"
-					asset_metadata[$folder_key]="$IDENTIFIER_ALIAS_TO_FOLDER["$alias"]"
-					asset_metadata[$match_key]="$match[1]"
+					asset_metadata[${identifier_type}.name]="$IDENTIFIER_ALIAS_TO_NAME["$alias"]"
+					asset_metadata[${identifier_type}.folder]="$IDENTIFIER_ALIAS_TO_FOLDER["$alias"]"
+					asset_metadata[${identifier_type}.match]="$match[1]"
 					break
 				fi
 			done
@@ -795,10 +781,6 @@ function parse_file() {
 		echo "ERR::$filepath::${${errors[*]}// /::}::"
 		return 0 # Return success to not stop the loop
 	fi
-
-	# for k in ${(k)asset_metadata}; do
-	# 	echo "DUBUG::$filepath::$k=${asset_metadata[$k]}"
-	# done
 
 	local asset_metadata_array=()
 	for metadata_key in ${(k)asset_metadata}; do
@@ -945,25 +927,7 @@ echo "Done."
 # --- Send Final Notification ---
 local notif_title="Complete: $TICKET_ID"
 local notif_subtitle="Processed $total_files files"
-local notif_body="Unresolved: $err_count | Duplicates: $warn_count"
+local notif_body="Errors: $err_count | Duplicates: $warn_count"
 
 show_notification "$notif_title" "$notif_subtitle" "$notif_body"
-#endregion
-
-#region == Debugging ==
-
-debug_file="$HOME/Documents/asset Organizer/debug_$SCRIPT_VERSION.txt"
-
-[[ ! -d ${debug_file:h} ]] && mkdir -p ${debug_file:h}
-[[ ! -f $debug_file ]] && touch $debug_file
-line_count=$(sed -n '$=' $debug_file)
-
-if [[ $line_count -lt 100000 ]]; then
-	echo "$results" >> "$debug_file"
-else
-	echo "$results" > "$debug_file"
-fi
-
-echo "---"
-
 #endregion
